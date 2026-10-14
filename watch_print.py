@@ -65,6 +65,7 @@ class PrintIntent:
     copies: int
     color: str
     sides: str
+    inferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,13 +74,30 @@ class FileFingerprint:
     mtime_ns: int
 
 
+class _ShortLevelFormatter(logging.Formatter):
+    _LEVEL_ALIASES = {"WARNING": "WARN"}
+
+    def format(self, record: logging.LogRecord) -> str:
+        original = record.levelname
+        record.levelname = self._LEVEL_ALIASES.get(original, original)
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original
+
+
 def setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _ShortLevelFormatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
 
 
 def normalize_path(path: Path) -> str:
@@ -242,6 +260,89 @@ def _coerce_choice(value: Any, allowed: set[str], field: str) -> str:
     return normalized
 
 
+_CN_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_COPIES_ARABIC_RE = re.compile(r"(\d{1,3})\s*(?:份|copies?)", re.IGNORECASE)
+_COPIES_CN_RE = re.compile(r"([一二两三四五六七八九十百零]+)\s*份")
+_EXPLICIT_FILENAME_RE = re.compile(
+    r"(?:\d{1,3}\s*(?:份|copies?))|"
+    r"(?:[一二两三四五六七八九十百零]+\s*份)|"
+    r"(?:彩印|彩色|彩打|黑白|单色|不打印|勿打印|无需打印)|"
+    r"(?:双面|单面)|"
+    r"(?:\b(?:color|mono|double|single|bw)\b)",
+    re.IGNORECASE,
+)
+
+
+def _parse_cn_number(text: str) -> int | None:
+    if text == "十":
+        return 10
+    if text == "百":
+        return 100
+    if text.startswith("十"):
+        ones = _CN_DIGITS.get(text[1], 0) if len(text) > 1 else 0
+        return 10 + ones
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _CN_DIGITS.get(left, 1) if left else 1
+        ones = _CN_DIGITS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    if text in _CN_DIGITS:
+        return _CN_DIGITS[text]
+    return None
+
+
+def parse_filename_intent(filename: str) -> PrintIntent | None:
+    """文件名含明确打印关键词时用正则解析，否则返回 None。"""
+    stem = Path(filename).stem
+    if not _EXPLICIT_FILENAME_RE.search(stem):
+        return None
+
+    copies = 1
+    arabic = _COPIES_ARABIC_RE.search(stem)
+    if arabic:
+        copies = int(arabic.group(1))
+    else:
+        chinese = _COPIES_CN_RE.search(stem)
+        if chinese:
+            parsed = _parse_cn_number(chinese.group(1))
+            if parsed is not None:
+                copies = parsed
+    copies = max(1, min(copies, MAX_COPIES))
+
+    color = "mono"
+    if re.search(r"彩印|彩色|彩打|\bcolor\b", stem, re.IGNORECASE):
+        color = "color"
+    if re.search(r"黑白|单色|\bmono\b|\bbw\b", stem, re.IGNORECASE):
+        color = "mono"
+
+    sides = "single"
+    if re.search(r"双面|\bdouble\b", stem, re.IGNORECASE):
+        sides = "double"
+    if re.search(r"单面|\bsingle\b", stem, re.IGNORECASE):
+        sides = "single"
+
+    need_print = not re.search(r"不打印|勿打印|无需打印", stem)
+    return PrintIntent(
+        need_print=need_print,
+        copies=copies,
+        color=color,
+        sides=sides,
+        inferred=False,
+    )
+
+
 def validate_intent(data: dict[str, Any]) -> PrintIntent:
     missing = [key for key in ("need_print", "copies", "color", "sides") if key not in data]
     if missing:
@@ -309,7 +410,8 @@ def build_intent_prompt(path: Path) -> str:
     except OSError:
         size = 0
     prompt = (
-        "你是打印店的意图识别助手。根据文件名、扩展名和可选文本，推断打印参数。\n"
+        "你是打印店的意图识别助手。文件名里没有“2份/彩印/双面”等明确需求，"
+        "请根据文件名、扩展名和文件内容做兜底猜测。\n"
         "只输出一个 JSON 对象，不要输出任何解释、Markdown 或其它文字。\n"
         "JSON 格式必须是：\n"
         '{"need_print": true, "copies": 2, "color": "color", "sides": "double"}\n'
@@ -317,12 +419,14 @@ def build_intent_prompt(path: Path) -> str:
         "- need_print: 是否需要打印。文档、试卷、作业、合同、照片、设计稿、"
         "PDF/Word/图片等为 true；压缩包、安装包、可执行文件、系统临时文件、"
         "明显不是给人看的数据文件为 false。\n"
-        "- copies: 打印份数，整数。文件名里有“2份/两份/x copies”等就用该数字，"
-        "未说明则填 1。必须是 1 到 100 的整数。\n"
-        "- color: 色彩模式，只能是 \"color\"（彩印）或 \"mono\"（黑白）。"
-        "文件名含彩印/彩色/color 用 color，含黑白/mono 用 mono，未说明默认 mono。\n"
-        "- sides: 单双面，只能是 \"single\" 或 \"double\"。"
-        "文件名含双面/double 用 double，含单面/single 用 single，未说明默认 single。\n"
+        "- copies: 打印份数，整数，必须是 1 到 100。未说明份数时默认 1。\n"
+        "- color: 只能是 \"color\" 或 \"mono\"。\n"
+        "- sides: 只能是 \"single\" 或 \"double\"。未说明时默认 single。\n"
+        "猜测规则（文件名无明确参数时必须遵守）：\n"
+        "- 会议日程、通知、纪要、合同、试卷、作业、简历、文字稿：1 份、mono、single。\n"
+        "- 照片、相片、自拍、海报、宣传单、设计稿、PPT 封面类图片：1 份、color、single。\n"
+        "- 图纸、说明书页数明显较多：1 份、mono、double。\n"
+        "- 无法判断时：1 份、mono、single。\n"
         f"文件名：{path.name}\n"
         f"扩展名：{path.suffix or '(无)'}\n"
         f"大小：{size} 字节\n"
@@ -355,14 +459,31 @@ def _call_ollama_once(path: Path, config: Config) -> PrintIntent:
 
 
 def analyze_print_intent(path: Path, config: Config) -> PrintIntent | None:
-    """调用本地 Ollama，校验打印意图 JSON。失败返回 None 以便稍后重试。"""
+    """优先用文件名正则解析；没有明确关键词时再调用 Ollama 兜底。"""
+    from_name = parse_filename_intent(path.name)
+    if from_name is not None:
+        log.info(
+            "从文件名解析 copies=%s color=%s sides=%s",
+            from_name.copies,
+            from_name.color,
+            from_name.sides,
+        )
+        return from_name
+
     last_error: Exception | None = None
     attempts = max(1, config.ollama_retries)
     for attempt in range(1, attempts + 1):
         try:
             intent = _call_ollama_once(path, config)
-            log.info("解析结果 copies=%s color=%s", intent.copies, intent.color)
-            return intent
+            guessed = PrintIntent(
+                need_print=intent.need_print,
+                copies=intent.copies,
+                color=intent.color,
+                sides=intent.sides,
+                inferred=True,
+            )
+            log.info("解析结果 copies=%s color=%s", guessed.copies, guessed.color)
+            return guessed
         except (RuntimeError, ValueError, TypeError) as exc:
             last_error = exc
             log.warning(
@@ -538,6 +659,15 @@ class WatchService:
             log.info("忽略文件：%s", path.name)
             self.tracker.complete(key, fingerprint)
             return
+        if intent.inferred:
+            log.warning(
+                "文件名未包含明确需求，已按推断参数执行，请店长注意确认。"
+                "文件=%s copies=%s color=%s sides=%s",
+                path.name,
+                intent.copies,
+                intent.color,
+                intent.sides,
+            )
         try:
             mock_print(str(path))
         except OSError:
