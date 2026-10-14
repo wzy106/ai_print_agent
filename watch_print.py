@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -50,8 +51,29 @@ def _read_text_preview(path: Path) -> str:
         return ""
 
 
-def should_print(path: Path, model: str) -> bool:
-    """调用本地 Ollama，判断该文件是否需要打印。"""
+def extract_json_object(text: str) -> dict | None:
+    """从模型原文中取出 JSON 对象并用 json 库解析。"""
+    raw = text.strip()
+    if not raw:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        raw = fenced.group(1)
+    else:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        raw = raw[start : end + 1]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def analyze_print_intent(path: Path, model: str) -> dict | None:
+    """调用本地 Ollama，解析打印意图 JSON。失败返回 None。"""
     preview = _read_text_preview(path)
     try:
         size = path.stat().st_size
@@ -59,10 +81,20 @@ def should_print(path: Path, model: str) -> bool:
         size = 0
 
     prompt = (
-        "你是打印店的意图识别助手。根据文件信息判断是否需要打印。\n"
-        "只回复一个英文词：PRINT 或 IGNORE。不要解释。\n"
-        "应打印：文档、试卷、作业、合同、照片、设计稿、PDF/Word/图片等常见打印件。\n"
-        "应忽略：压缩包、安装包、可执行文件、系统临时文件、明显不是给人看的数据文件。\n"
+        "你是打印店的意图识别助手。根据文件名、扩展名和可选文本，推断打印参数。\n"
+        "只输出一个 JSON 对象，不要输出任何解释、Markdown 或其它文字。\n"
+        "JSON 格式必须是：\n"
+        '{"need_print": true, "copies": 2, "color": "color", "sides": "double"}\n'
+        "字段说明：\n"
+        "- need_print: 是否需要打印。文档、试卷、作业、合同、照片、设计稿、"
+        "PDF/Word/图片等为 true；压缩包、安装包、可执行文件、系统临时文件、"
+        "明显不是给人看的数据文件为 false。\n"
+        "- copies: 打印份数，整数。文件名里有“2份/两份/x copies”等就用该数字，"
+        "未说明则填 1。\n"
+        "- color: 色彩模式，只能是 \"color\"（彩印）或 \"mono\"（黑白）。"
+        "文件名含彩印/彩色/color 用 color，含黑白/mono 用 mono，未说明默认 mono。\n"
+        "- sides: 单双面，只能是 \"single\" 或 \"double\"。"
+        "文件名含双面/double 用 double，含单面/single 用 single，未说明默认 single。\n"
         f"文件名：{path.name}\n"
         f"扩展名：{path.suffix or '(无)'}\n"
         f"大小：{size} 字节\n"
@@ -75,6 +107,7 @@ def should_print(path: Path, model: str) -> bool:
             "model": model,
             "prompt": prompt,
             "stream": False,
+            "format": "json",
             "options": {"temperature": 0},
         }
     ).encode("utf-8")
@@ -89,16 +122,21 @@ def should_print(path: Path, model: str) -> bool:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         log.warning("Ollama 调用失败，按忽略处理：%s", exc)
-        return False
+        return None
     except json.JSONDecodeError:
         log.warning("Ollama 返回无法解析，按忽略处理：%s", path.name)
-        return False
+        return None
 
-    answer = str(body.get("response", "")).strip().upper()
-    first = answer.split()[0] if answer else ""
-    first = first.strip(".,;:\"'`")
-    log.info("Ollama 判断：%s -> %s", path.name, first or "(空)")
-    return first == "PRINT"
+    answer = str(body.get("response", "")).strip()
+    data = extract_json_object(answer)
+    if data is None:
+        log.warning("未能解析 JSON：%s | 原文：%s", path.name, answer[:200])
+        return None
+
+    copies = data.get("copies", 1)
+    color = data.get("color", "mono")
+    log.info("解析结果 copies=%s color=%s", copies, color)
+    return data
 
 
 def mock_print(file_path: str) -> None:
@@ -164,7 +202,8 @@ def handle_new_file(path: Path, processed: set[str]) -> None:
 
     processed.add(resolved)
     log.info("检测到新文件：%s", path.name)
-    if not should_print(path, OLLAMA_MODEL):
+    intent = analyze_print_intent(path, OLLAMA_MODEL)
+    if not intent or not intent.get("need_print"):
         log.info("忽略文件：%s", path.name)
         return
     try:
