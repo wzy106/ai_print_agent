@@ -1,32 +1,104 @@
 """
-监控打印接收目录：有新文件时打印日志并调用 mock_print。
+监控打印接收目录：有新文件时先问本地 Ollama 是否需要打印，
+需要则调用 mock_print，否则忽略。
 
 依赖（推荐）：
     pip install watchdog
 
 无 watchdog 时会自动改用轮询，功能相同。
+Ollama 需在本机 11434 端口运行。
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 WATCH_DIR = Path(r"C:\打印接收")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_TIMEOUT = 60.0
 STABLE_SECONDS = 0.8
 POLL_INTERVAL = 1.0
 IGNORE_SUFFIXES = {".tmp", ".temp", ".crdownload", ".part"}
 IGNORE_PREFIXES = ("~$", ".",)
+TEXT_PREVIEW_SUFFIXES = {".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm", ".log"}
+MAX_PREVIEW_CHARS = 800
 
 logging.basicConfig(
     level=logging.INFO,
     format="[%(levelname)s] %(message)s",
 )
 log = logging.getLogger("watch_print")
+
+
+def _read_text_preview(path: Path) -> str:
+    if path.suffix.lower() not in TEXT_PREVIEW_SUFFIXES:
+        return ""
+    try:
+        data = path.read_bytes()[: MAX_PREVIEW_CHARS * 4]
+        text = data.decode("utf-8", errors="ignore").strip()
+        return text[:MAX_PREVIEW_CHARS]
+    except OSError:
+        return ""
+
+
+def should_print(path: Path, model: str) -> bool:
+    """调用本地 Ollama，判断该文件是否需要打印。"""
+    preview = _read_text_preview(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+
+    prompt = (
+        "你是打印店的意图识别助手。根据文件信息判断是否需要打印。\n"
+        "只回复一个英文词：PRINT 或 IGNORE。不要解释。\n"
+        "应打印：文档、试卷、作业、合同、照片、设计稿、PDF/Word/图片等常见打印件。\n"
+        "应忽略：压缩包、安装包、可执行文件、系统临时文件、明显不是给人看的数据文件。\n"
+        f"文件名：{path.name}\n"
+        f"扩展名：{path.suffix or '(无)'}\n"
+        f"大小：{size} 字节\n"
+    )
+    if preview:
+        prompt += f"文本预览：\n{preview}\n"
+
+    payload = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0},
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        log.warning("Ollama 调用失败，按忽略处理：%s", exc)
+        return False
+    except json.JSONDecodeError:
+        log.warning("Ollama 返回无法解析，按忽略处理：%s", path.name)
+        return False
+
+    answer = str(body.get("response", "")).strip().upper()
+    first = answer.split()[0] if answer else ""
+    first = first.strip(".,;:\"'`")
+    log.info("Ollama 判断：%s -> %s", path.name, first or "(空)")
+    return first == "PRINT"
 
 
 def mock_print(file_path: str) -> None:
@@ -92,6 +164,9 @@ def handle_new_file(path: Path, processed: set[str]) -> None:
 
     processed.add(resolved)
     log.info("检测到新文件：%s", path.name)
+    if not should_print(path, OLLAMA_MODEL):
+        log.info("忽略文件：%s", path.name)
+        return
     try:
         mock_print(str(path))
     except Exception:
@@ -164,13 +239,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="启动时也对目录里已有文件执行模拟打印",
     )
+    parser.add_argument(
+        "--model",
+        default=OLLAMA_MODEL,
+        help="Ollama 模型名，默认 qwen2.5:3b，也可用环境变量 OLLAMA_MODEL",
+    )
     return parser.parse_args()
 
 
+def ping_ollama() -> bool:
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=5) as response:
+            return 200 <= response.status < 300
+    except urllib.error.URLError:
+        return False
+
+
 def main() -> int:
+    global OLLAMA_MODEL
     args = parse_args()
+    OLLAMA_MODEL = args.model
     watch_dir = Path(args.dir)
     watch_dir.mkdir(parents=True, exist_ok=True)
+
+    if ping_ollama():
+        log.info("已连接 Ollama：%s ，模型：%s", OLLAMA_HOST, OLLAMA_MODEL)
+    else:
+        log.warning(
+            "无法连接 Ollama（%s）。请先启动 ollama serve，意图识别失败时将忽略文件。",
+            OLLAMA_HOST,
+        )
 
     processed = set() if args.include_existing else scan_existing(watch_dir)
     if args.include_existing:
