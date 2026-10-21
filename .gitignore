@@ -1,3 +1,22 @@
-"__pycache__/" 
-"*.log" 
-"*.pyc" 
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境（如果你有的话）
+venv/
+.venv/
+env/
+
+# 数据库文件（本地测试数据，不该传到远端）
+*.db
+*.db-shm
+*.db-wal
+
+# 日志和临时文件
+*.log
+.DS_Store
+Thumbs.db
+
+# 监控目录测试用的临时截图（如果你项目里有放测试图的文件夹）
+test_images/
