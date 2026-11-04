@@ -56,3 +56,9 @@ python floating_window.py
 
 # 或者：纯后台启动目录监控
 python watch_print.py --dir "C:\打印接收"
+
+## 单元测试
+本项目使用 pytest 进行核心逻辑的回归测试。运行以下命令可验证正则解析与数据校验逻辑：
+```powershell
+pip install pytest
+pytest test_watch_print.py -v
