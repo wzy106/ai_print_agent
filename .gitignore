@@ -20,3 +20,6 @@ Thumbs.db
 
 # 监控目录测试用的临时截图（如果你项目里有放测试图的文件夹）
 test_images/
+
+# 测试缓存
+.pytest_cache/
