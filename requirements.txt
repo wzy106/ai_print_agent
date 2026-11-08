@@ -1,1 +1,14 @@
+# 文件系统监控 (watch_print.py)
 watchdog>=4.0.0
+
+# Windows 底层打印与 COM 接口 (print_engine.py)
+pywin32>=306
+
+# 图像处理与 PDF 转换 (print_engine.py)
+Pillow>=10.0.0
+
+# 桌面悬浮窗 GUI (floating_window.py)
+PyQt5>=5.15.9
+
+# 单元测试 (test_watch_print.py)
+pytest>=7.0.0
