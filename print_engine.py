@@ -112,7 +112,15 @@ class PrintEngine:
                 app.Visible = False
                 app.DisplayAlerts = False
                 wb = app.Workbooks.Open(abs_in)
-                # 0 = xlTypePDF
+                
+                # 【核心修复】必须先获取具体的“工作表”（Sheet），再设置页面
+                # 如果表格有多个 Sheet，通常只设置当前激活的那个
+                sheet = wb.ActiveSheet
+                sheet.PageSetup.Zoom = False
+                sheet.PageSetup.FitToPagesWide = 1    # 缩放到一页宽
+                sheet.PageSetup.FitToPagesTall = False # 高度不限
+                
+                # 导出为 PDF (0 代表 xlTypePDF)
                 wb.ExportAsFixedFormat(0, abs_out)
                 wb.Close(False)
 

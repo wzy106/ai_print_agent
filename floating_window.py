@@ -2,6 +2,7 @@ import sys
 import re
 import time
 import logging
+import pythoncom
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, 
@@ -57,6 +58,10 @@ class ParseWorker(QThread):
 
     def run(self):
         """线程启动后实际执行的逻辑"""
+        # 【核心修复】在子线程启动时初始化 COM 组件
+        # 否则 print_engine 唤醒 WPS/Office 时会报 (-2147221008, '尚未调用 CoInitialize。') 错误
+        pythoncom.CoInitialize()
+        
         path = Path(self.file_path)
         db = None
         try:
@@ -119,6 +124,8 @@ class ParseWorker(QThread):
             self.finished.emit({}, f"系统异常: {str(e)}", "failed")
         finally:
             if db: db.close()
+            # 【核心修复】线程结束前必须注销 COM，释放资源，防止内存泄漏
+            pythoncom.CoUninitialize()
 
 
 # ==========================================
