@@ -695,7 +695,8 @@ class WatchService:
             log.warning("文件名未包含明确需求，按推断执行。文件=%s", path.name)
         
         try:
-            print_result = self.print_engine.execute(str(path))
+            # 【核心修改】把解析出来的 intent 传给引擎，让底层能够根据份数/颜色/单双面去构建打印参数
+            print_result = self.print_engine.execute(str(path), intent)
             
             if print_result["status"] == "failed":
                 self.db.log(path, intent=intent, source=source, status="failed", error=print_result["msg"])
@@ -891,7 +892,7 @@ if __name__ == "__main__":
 #              │
 #              ├── (如果不打印) -> PrintLogDB.log(ignored)
 #              │
-#              ├── print_engine.execute? (真实打印引擎)
+#              ├── print_engine.execute(path, intent)? (真实打印引擎)
 #              │     ├── _normalize (格式转 PDF)
 #              │     ├── 模式 A (无实体机) -> 存桌面 (success)
 #              │     ├── 模式 B (有实体机) -> Sumatra静默打印 (success)

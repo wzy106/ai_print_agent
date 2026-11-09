@@ -20,7 +20,7 @@ from watch_print import (
 )
 from print_engine import PrintEngine
 
-# 【全局单例】整个应用生命周期只实例化一次打印引擎，避免重复探测环境。
+# 【全局单例】整个应用生命周期只实例化一次打印引擎，避免每次处理文件时重复探测环境、读注册表。
 global_print_engine = PrintEngine()
 
 # 初始化全局配置对象
@@ -32,7 +32,7 @@ config = Config(
     processed_ttl=86400.0, processed_max=20000, log_level="INFO", db_path=Path(DEFAULT_DB_PATH)
 )
 
-# 意图关键词正则：用于过滤剪贴板里的垃圾信息
+# 意图关键词正则：用于过滤剪贴板里的垃圾信息，只有包含这些词才认为是“打印需求”
 INTENT_KEYWORDS = re.compile(r"(打印|彩|黑白|单面|双面|\d+份|[一二两三四五六七八九十]+份)")
 
 # 时间窗口（秒）：如果剪贴板变动超过这个时间，就认为是历史脏数据，不再与拖拽的文件绑定
@@ -95,7 +95,8 @@ class ParseWorker(QThread):
                 return
 
             # 【执行打印】调用全局打印引擎
-            print_result = global_print_engine.execute(str(path))
+            # 【重要更新】把解析出来的 intent 传给引擎，让底层能够根据份数/颜色/单双面去构建打印参数
+            print_result = global_print_engine.execute(str(path), intent)
             
             # 明确区分 failed 和 fallback 状态
             if print_result["status"] == "failed":
